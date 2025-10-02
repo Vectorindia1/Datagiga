@@ -24,7 +24,7 @@ try:
 except:
     pass  # Extension might already be installed
 
-print(f"📊 Using persistent database: {DB_FILE}")
+print(f"[DB] Using persistent database: {DB_FILE}")
 
 from contextlib import asynccontextmanager
 
@@ -32,7 +32,7 @@ from contextlib import asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     os.makedirs("uploads", exist_ok=True)
-    print("🚀 Local Gigasheet Clone started!")
+    print("[STARTUP] Local Gigasheet Clone started!")
     yield
     # Shutdown
     pass
@@ -74,6 +74,69 @@ class GigasheetProcessor:
                 "columns": [{"name": col[0], "type": col[1]} for col in columns]
             }
         except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+    
+    async def process_file(self, file_path: str, table_name: str, file_extension: str):
+        """Process different file formats (CSV, Excel, TXT)"""
+        try:
+            print(f"[PROCESSING] File: {file_path}, Type: {file_extension}")
+            
+            if file_extension in ['.csv', '.txt']:
+                # Use DuckDB's fast CSV reader
+                # For .txt files, we'll try to auto-detect delimiter
+                self.conn.execute(f"""
+                    CREATE OR REPLACE TABLE {table_name} AS 
+                    SELECT * FROM read_csv_auto('{file_path}', 
+                        header=true, 
+                        ignore_errors=true,
+                        max_line_size=1048576)
+                """)
+                
+            elif file_extension in ['.xlsx', '.xls']:
+                # Use pandas for Excel files with optimization
+                import pandas as pd
+                print(f"[EXCEL] Reading Excel file: {file_path}")
+                
+                # Get file size for progress indication
+                file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+                print(f"[EXCEL] File size: {file_size_mb:.2f} MB")
+                
+                # Read Excel file with engine selection
+                if file_extension == '.xlsx':
+                    df = pd.read_excel(file_path, engine='openpyxl')
+                else:
+                    df = pd.read_excel(file_path, engine='xlrd')
+                    
+                print(f"[EXCEL] Loaded {len(df):,} rows, {len(df.columns)} columns")
+                
+                # Register with DuckDB and create table
+                print(f"[EXCEL] Creating table in DuckDB...")
+                self.conn.register('temp_excel_data', df)
+                self.conn.execute(f"""
+                    CREATE OR REPLACE TABLE {table_name} AS 
+                    SELECT * FROM temp_excel_data
+                """)
+                self.conn.unregister('temp_excel_data')
+                print(f"[EXCEL] Table created successfully")
+                
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_extension}")
+            
+            # Get table info
+            row_count = self.conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+            columns = self.conn.execute(f"DESCRIBE {table_name}").fetchall()
+            
+            print(f"[SUCCESS] Table created: {table_name} ({row_count} rows, {len(columns)} columns)")
+            
+            return {
+                "success": True,
+                "table_name": table_name,
+                "row_count": row_count,
+                "columns": [{"name": col[0], "type": col[1]} for col in columns],
+                "file_type": file_extension
+            }
+        except Exception as e:
+            print(f"[ERROR] Failed to process file: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
     
     def get_data_page(self, table_name: str, offset: int = 0, limit: int = 1000,
@@ -140,15 +203,17 @@ processor = GigasheetProcessor()
 def root():
     """Root endpoint with API information"""
     return {
-        "message": "🚀 Local Gigasheet Clone API",
-        "version": "2.0",
+        "message": "Local Gigasheet Clone API",
+        "version": "2.1",
         "features": {
             "persistent_storage": True,
             "32gb_ram_optimized": True,
+            "supported_upload_formats": [".csv", ".xlsx", ".xls", ".txt"],
             "export_formats": ["CSV", "Parquet", "Excel"],
             "backup_system": True
         },
         "endpoints": {
+            "upload": "/upload (POST - supports CSV, Excel, TXT)",
             "database_status": "/database/status",
             "system_status": "/system/status",
             "tables": "/tables",
@@ -159,9 +224,26 @@ def root():
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
-    """Upload and process large CSV files"""
-    if not file.filename.lower().endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Only CSV files supported")
+    """Upload and process CSV, Excel (.xlsx, .xls), and TXT files"""
+    
+    # Get file extension
+    filename_lower = file.filename.lower()
+    file_extension = None
+    
+    # Supported formats
+    supported_formats = ['.csv', '.xlsx', '.xls', '.txt']
+    for ext in supported_formats:
+        if filename_lower.endswith(ext):
+            file_extension = ext
+            break
+    
+    if not file_extension:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Unsupported file format. Supported formats: {', '.join(supported_formats)}"
+        )
+    
+    print(f"[UPLOAD] Received file: {file.filename} (Type: {file_extension})")
     
     # Save file
     file_path = f"uploads/{file.filename}"
@@ -169,9 +251,23 @@ async def upload_file(file: UploadFile = File(...)):
         content = await file.read()
         buffer.write(content)
     
-    # Process with DuckDB
-    table_name = file.filename.replace('.csv', '').replace('-', '_').replace(' ', '_').lower()
-    result = await processor.process_csv_file(file_path, table_name)
+    print(f"[UPLOAD] File saved to: {file_path}")
+    
+    # Generate table name (remove extension and clean up)
+    base_name = file.filename
+    for ext in supported_formats:
+        base_name = base_name.replace(ext, '').replace(ext.upper(), '')
+    
+    table_name = base_name.replace('-', '_').replace(' ', '_').replace('.', '_').lower()
+    
+    # Process file based on format
+    result = await processor.process_file(file_path, table_name, file_extension)
+    
+    # Add info field to match frontend expectations
+    result["info"] = {
+        "row_count": result["row_count"],
+        "columns": result["columns"]
+    }
     
     return result
 
@@ -215,7 +311,7 @@ async def merge_excel_files():
     if not excel_files:
         raise HTTPException(status_code=404, detail="No Excel files found in data folder")
     
-    print(f"🚀 Processing {len(excel_files)} Excel files...")
+    print(f"[MERGE] Processing {len(excel_files)} Excel files...")
     
     # Drop existing table
     processor.conn.execute("DROP TABLE IF EXISTS merged_excel_data")
@@ -225,7 +321,7 @@ async def merge_excel_files():
     
     for i, file in enumerate(excel_files):
         file_path = os.path.join(excel_folder, file)
-        print(f"📊 Processing {file} ({i+1}/{len(excel_files)})...")
+        print(f"[EXCEL] Processing {file} ({i+1}/{len(excel_files)})...")
         
         try:
             # Read Excel file with pandas
@@ -238,17 +334,17 @@ async def merge_excel_files():
             all_dataframes.append(df)
             total_rows_processed += len(df)
             
-            print(f"✅ {file}: {len(df)} rows loaded")
+            print(f"[SUCCESS] {file}: {len(df)} rows loaded")
             
         except Exception as e:
-            print(f"❌ Error reading {file}: {str(e)}")
+            print(f"[ERROR] Error reading {file}: {str(e)}")
             continue
     
     if not all_dataframes:
         raise HTTPException(status_code=500, detail="No Excel files could be processed")
     
     # Combine all dataframes
-    print("🔄 Combining all data...")
+    print("[MERGE] Combining all data...")
     combined_df = pd.concat(all_dataframes, ignore_index=True)
     
     # Register the DataFrame with DuckDB
@@ -263,13 +359,163 @@ async def merge_excel_files():
     # Get final count
     row_count = processor.conn.execute("SELECT COUNT(*) FROM merged_excel_data").fetchone()[0]
     
-    print(f"✅ Successfully merged {len(excel_files)} files with {row_count} total rows")
+    print(f"[SUCCESS] Successfully merged {len(excel_files)} files with {row_count} total rows")
     
     return {
         "message": f"Successfully merged {len(excel_files)} Excel files",
         "table_name": "merged_excel_data",
         "files_processed": excel_files,
         "total_rows": row_count
+    }
+
+@app.post("/merge-all-data")
+async def merge_all_data():
+    """Merge ALL data from all sources (Excel, CSV, TXT, uploaded files) into one master table"""
+    import pandas as pd
+    import glob
+    
+    print("[MERGE-ALL] Starting comprehensive data merge...")
+    
+    all_dataframes = []
+    files_processed = []
+    errors = []
+    
+    # Define source directories and file patterns
+    sources = [
+        {"dir": "../data", "patterns": ["*.xlsx", "*.xls", "*.csv", "*.txt"], "label": "data folder"},
+        {"dir": "uploads", "patterns": ["*.xlsx", "*.xls", "*.csv", "*.txt"], "label": "uploads folder"}
+    ]
+    
+    # Also merge existing tables from database
+    try:
+        existing_tables = [t[0] for t in processor.conn.execute("SHOW TABLES").fetchall()]
+        print(f"[MERGE-ALL] Found {len(existing_tables)} existing tables in database")
+    except:
+        existing_tables = []
+    
+    # Process files from directories
+    for source in sources:
+        source_dir = source["dir"]
+        if not os.path.exists(source_dir):
+            print(f"[MERGE-ALL] Skipping {source['label']} - directory not found")
+            continue
+        
+        print(f"[MERGE-ALL] Scanning {source['label']}: {source_dir}")
+        
+        for pattern in source["patterns"]:
+            files = glob.glob(os.path.join(source_dir, pattern))
+            
+            for file_path in files:
+                filename = os.path.basename(file_path)
+                file_ext = os.path.splitext(filename)[1].lower()
+                
+                print(f"[MERGE-ALL] Processing: {filename}")
+                
+                try:
+                    # Read file based on extension
+                    if file_ext in ['.xlsx', '.xls']:
+                        df = pd.read_excel(file_path)
+                    elif file_ext == '.csv':
+                        df = pd.read_csv(file_path, encoding='utf-8', on_bad_lines='skip')
+                    elif file_ext == '.txt':
+                        # Try to read as CSV with different delimiters
+                        try:
+                            df = pd.read_csv(file_path, sep='\t', encoding='utf-8', on_bad_lines='skip')
+                        except:
+                            df = pd.read_csv(file_path, sep=',', encoding='utf-8', on_bad_lines='skip')
+                    else:
+                        continue
+                    
+                    # Add metadata columns
+                    df['_source_file'] = filename
+                    df['_source_folder'] = source['label']
+                    df['_file_type'] = file_ext
+                    
+                    all_dataframes.append(df)
+                    files_processed.append(filename)
+                    
+                    print(f"[SUCCESS] {filename}: {len(df)} rows, {len(df.columns)} columns")
+                    
+                except Exception as e:
+                    error_msg = f"{filename}: {str(e)}"
+                    errors.append(error_msg)
+                    print(f"[ERROR] {error_msg}")
+                    continue
+    
+    # Also include data from existing database tables (excluding the merge tables)
+    excluded_tables = ['merged_all_data', 'merged_excel_data']
+    for table_name in existing_tables:
+        if table_name not in excluded_tables:
+            try:
+                print(f"[MERGE-ALL] Including existing table: {table_name}")
+                df = processor.conn.execute(f"SELECT * FROM {table_name}").df()
+                
+                # Add metadata
+                df['_source_file'] = f"table_{table_name}"
+                df['_source_folder'] = "database"
+                df['_file_type'] = ".table"
+                
+                all_dataframes.append(df)
+                files_processed.append(f"table:{table_name}")
+                
+                print(f"[SUCCESS] Table {table_name}: {len(df)} rows")
+            except Exception as e:
+                error_msg = f"table:{table_name}: {str(e)}"
+                errors.append(error_msg)
+                print(f"[ERROR] {error_msg}")
+    
+    # Check if we have any data to merge
+    if not all_dataframes:
+        raise HTTPException(
+            status_code=404, 
+            detail="No data found to merge. Please upload files or add them to the data folder."
+        )
+    
+    print(f"[MERGE-ALL] Combining {len(all_dataframes)} data sources...")
+    
+    # Combine all dataframes with column alignment
+    # Use outer join to include all columns from all sources
+    try:
+        combined_df = pd.concat(all_dataframes, ignore_index=True, sort=False)
+        print(f"[MERGE-ALL] Combined dataframe: {len(combined_df)} rows, {len(combined_df.columns)} columns")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error combining data: {str(e)}")
+    
+    # Drop the old merged_all_data table if it exists
+    try:
+        processor.conn.execute("DROP TABLE IF EXISTS merged_all_data")
+    except:
+        pass
+    
+    # Register and create persistent table
+    try:
+        processor.conn.register('temp_merged_all', combined_df)
+        processor.conn.execute("""
+            CREATE TABLE merged_all_data AS 
+            SELECT * FROM temp_merged_all
+        """)
+        processor.conn.unregister('temp_merged_all')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating merged table: {str(e)}")
+    
+    # Get final statistics
+    row_count = processor.conn.execute("SELECT COUNT(*) FROM merged_all_data").fetchone()[0]
+    column_count = len(processor.conn.execute("DESCRIBE merged_all_data").fetchall())
+    
+    print(f"[SUCCESS] Merged all data: {row_count} rows, {column_count} columns")
+    print(f"[MERGE-ALL] Files processed: {len(files_processed)}")
+    if errors:
+        print(f"[MERGE-ALL] Errors encountered: {len(errors)}")
+    
+    return {
+        "message": f"Successfully merged all data from {len(files_processed)} sources",
+        "table_name": "merged_all_data",
+        "files_processed": files_processed,
+        "total_rows": row_count,
+        "total_columns": column_count,
+        "sources_merged": len(all_dataframes),
+        "errors": errors if errors else None,
+        "note": "All your data is now in 'merged_all_data' table - search across everything!"
     }
 
 # 💾 DATA PERSISTENCE & TRANSFER ENDPOINTS
@@ -452,6 +698,88 @@ async def restore_from_backup(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Restore error: {str(e)}")
 
+# 🔍 GLOBAL SEARCH ENDPOINT
+
+@app.get("/tables/{table_name}/search")
+def global_search(
+    table_name: str,
+    query: str = Query(..., min_length=1),
+    limit: int = Query(100, ge=1, le=1000),
+    offset: int = Query(0, ge=0)
+):
+    """Search across all columns in a table for matching records"""
+    try:
+        # Verify table exists
+        tables = [t[0] for t in processor.conn.execute("SHOW TABLES").fetchall()]
+        if table_name not in tables:
+            raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found")
+        
+        # Get all columns from the table
+        columns_result = processor.conn.execute(f"DESCRIBE {table_name}").fetchall()
+        columns = [col[0] for col in columns_result]
+        
+        print(f"[SEARCH] Searching table '{table_name}' for: '{query}'")
+        print(f"[SEARCH] Columns to search: {columns}")
+        
+        # Build search conditions for all columns
+        # Use CAST to VARCHAR and ILIKE for case-insensitive search
+        search_conditions = []
+        for col in columns:
+            # Escape single quotes in query for SQL safety
+            safe_query = query.replace("'", "''")
+            search_conditions.append(f"CAST({col} AS VARCHAR) ILIKE '%{safe_query}%'")
+        
+        # Combine all conditions with OR
+        where_clause = " OR ".join(search_conditions)
+        
+        # Build the full query
+        search_query = f"""
+            SELECT * FROM {table_name}
+            WHERE {where_clause}
+            LIMIT {limit} OFFSET {offset}
+        """
+        
+        # Execute search
+        result = processor.conn.execute(search_query).fetchall()
+        
+        # Convert to JSON-serializable format
+        data = []
+        for row in result:
+            row_dict = {}
+            for i, val in enumerate(row):
+                # Handle different data types
+                if val is None:
+                    row_dict[columns[i]] = None
+                elif isinstance(val, (int, float, str, bool)):
+                    row_dict[columns[i]] = val
+                else:
+                    row_dict[columns[i]] = str(val)
+            data.append(row_dict)
+        
+        # Get total count of matching records
+        count_query = f"""
+            SELECT COUNT(*) FROM {table_name}
+            WHERE {where_clause}
+        """
+        total_matches = processor.conn.execute(count_query).fetchone()[0]
+        
+        print(f"[SEARCH] Found {total_matches} matches, returning {len(data)} results")
+        
+        return {
+            "query": query,
+            "table_name": table_name,
+            "data": data,
+            "columns": columns,
+            "total_matches": total_matches,
+            "returned_count": len(data),
+            "offset": offset,
+            "limit": limit
+        }
+        
+    except Exception as e:
+        print(f"[SEARCH ERROR] {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
+
 @app.get("/exports/list")
 def list_exports():
     """List all available export files"""
@@ -570,7 +898,7 @@ def check_billion_row_readiness():
 
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Starting Local Gigasheet Backend...")
-    print("📊 DuckDB initialized with enterprise config")
-    print("🌐 Server will be available at: http://localhost:8000")
+    print("[BACKEND] Starting Local Gigasheet Backend...")
+    print("[DUCKDB] Initialized with enterprise config")
+    print("[SERVER] Available at: http://localhost:8000")
     uvicorn.run(app, host="localhost", port=8000)
