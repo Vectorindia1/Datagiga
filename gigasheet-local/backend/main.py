@@ -1,22 +1,28 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import duckdb
 import os
 import json
 from typing import Optional
 import asyncio
 import pandas as pd
+from pathlib import Path
 
 
 # Initialize PERSISTENT DuckDB - Optimized for 32GB RAM System! 🚀
-DB_FILE = 'gigasheet_persistent.db'
-conn = duckdb.connect(DB_FILE, config={
-    'threads': 16,              # Use more threads for parallel processing
-    'memory_limit': '24GB',     # Use 24GB of your 32GB RAM
-    'max_memory': '28GB',       # Peak usage up to 28GB
-    'temp_directory': './temp_duckdb'
-})
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, 'gigasheet_persistent.db')
+TEMP_DIR = os.path.join(BASE_DIR, 'temp_duckdb')
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# Connect first, then set configuration pragmas to avoid config deserialization issues
+conn = duckdb.connect(DB_FILE)
+conn.execute("SET threads=16")
+conn.execute("SET memory_limit='24GB'")
+sanitized_temp = TEMP_DIR.replace('\\','/')
+conn.execute("SET temp_directory='" + sanitized_temp + "'")
 
 # Install and load extensions
 try:
@@ -46,6 +52,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Static frontend mounting
+FRONTEND_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "frontend"))
+if os.path.isdir(FRONTEND_DIR):
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+    @app.get("/ui")
+    def serve_ui():
+        index_path = os.path.join(FRONTEND_DIR, "index.html")
+        if os.path.exists(index_path):
+            return FileResponse(index_path)
+        raise HTTPException(status_code=404, detail="UI not found")
 
 class GigasheetProcessor:
     def __init__(self):
@@ -81,6 +99,11 @@ class GigasheetProcessor:
         try:
             print(f"[PROCESSING] File: {file_path}, Type: {file_extension}")
             
+            # Check if table already exists
+            existing_tables = [t[0] for t in self.conn.execute("SHOW TABLES").fetchall()]
+            if table_name in existing_tables:
+                print(f"[WARNING] Table {table_name} already exists, replacing...")
+            
             if file_extension in ['.csv', '.txt']:
                 # Use DuckDB's fast CSV reader
                 # For .txt files, we'll try to auto-detect delimiter
@@ -95,29 +118,45 @@ class GigasheetProcessor:
             elif file_extension in ['.xlsx', '.xls']:
                 # Use pandas for Excel files with optimization
                 import pandas as pd
+                import gc
                 print(f"[EXCEL] Reading Excel file: {file_path}")
                 
                 # Get file size for progress indication
                 file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
                 print(f"[EXCEL] File size: {file_size_mb:.2f} MB")
                 
-                # Read Excel file with engine selection
-                if file_extension == '.xlsx':
-                    df = pd.read_excel(file_path, engine='openpyxl')
-                else:
-                    df = pd.read_excel(file_path, engine='xlrd')
+                try:
+                    # Read Excel file with engine selection and chunking for large files
+                    if file_extension == '.xlsx':
+                        df = pd.read_excel(file_path, engine='openpyxl')
+                    else:
+                        df = pd.read_excel(file_path, engine='xlrd')
+                        
+                    print(f"[EXCEL] Loaded {len(df):,} rows, {len(df.columns)} columns")
                     
-                print(f"[EXCEL] Loaded {len(df):,} rows, {len(df.columns)} columns")
-                
-                # Register with DuckDB and create table
-                print(f"[EXCEL] Creating table in DuckDB...")
-                self.conn.register('temp_excel_data', df)
-                self.conn.execute(f"""
-                    CREATE OR REPLACE TABLE {table_name} AS 
-                    SELECT * FROM temp_excel_data
-                """)
-                self.conn.unregister('temp_excel_data')
-                print(f"[EXCEL] Table created successfully")
+                    # Clean column names to avoid SQL issues
+                    df.columns = [str(col).replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '').replace('.', '_') for col in df.columns]
+                    
+                    # Register with DuckDB and create table
+                    print(f"[EXCEL] Creating table in DuckDB...")
+                    self.conn.register('temp_excel_data', df)
+                    self.conn.execute(f"""
+                        CREATE OR REPLACE TABLE {table_name} AS 
+                        SELECT * FROM temp_excel_data
+                    """)
+                    self.conn.unregister('temp_excel_data')
+                    print(f"[EXCEL] Table created successfully")
+                    
+                    # Force garbage collection to free memory
+                    del df
+                    gc.collect()
+                    
+                except MemoryError as me:
+                    print(f"[ERROR] Memory error processing {file_path}: {str(me)}")
+                    raise HTTPException(status_code=507, detail="File too large for available memory")
+                except Exception as ee:
+                    print(f"[ERROR] Excel processing error: {str(ee)}")
+                    raise
                 
             else:
                 raise HTTPException(status_code=400, detail=f"Unsupported file format: {file_extension}")
@@ -135,20 +174,24 @@ class GigasheetProcessor:
                 "columns": [{"name": col[0], "type": col[1]} for col in columns],
                 "file_type": file_extension
             }
+        except HTTPException:
+            raise
         except Exception as e:
             print(f"[ERROR] Failed to process file: {str(e)}")
+            import traceback
+            traceback.print_exc()
             raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
     
-    def get_data_page(self, table_name: str, offset: int = 0, limit: int = 1000,
+    def get_data_page(self, table_name: str, offset: int = 0, limit: Optional[int] = 1000,
                       filters: dict = None, sort_by: str = None, sort_desc: bool = False):
-        """Get paginated data with server-side filtering"""
+        """Get data with optional pagination and server-side filtering"""
         try:
             # Build query
             where_clause = ""
             if filters:
                 conditions = []
                 for col, val in filters.items():
-                    if val and val.strip():
+                    if val and str(val).strip():
                         # Use ILIKE for case-insensitive search
                         conditions.append(f"CAST({col} AS VARCHAR) ILIKE '%{val}%'")
                 if conditions:
@@ -160,12 +203,19 @@ class GigasheetProcessor:
                 order_clause = f"ORDER BY {sort_by} {direction}"
             
             # Get data
-            query = f"""
-                SELECT * FROM {table_name} 
-                {where_clause}
-                {order_clause}
-                LIMIT {limit} OFFSET {offset}
-            """
+            if limit is None:
+                query = f"""
+                    SELECT * FROM {table_name}
+                    {where_clause}
+                    {order_clause}
+                """
+            else:
+                query = f"""
+                    SELECT * FROM {table_name} 
+                    {where_clause}
+                    {order_clause}
+                    LIMIT {limit} OFFSET {offset}
+                """
             
             result = self.conn.execute(query).fetchall()
             columns = [desc[0] for desc in self.conn.description]
@@ -226,50 +276,63 @@ def root():
 async def upload_file(file: UploadFile = File(...)):
     """Upload and process CSV, Excel (.xlsx, .xls), and TXT files"""
     
-    # Get file extension
-    filename_lower = file.filename.lower()
-    file_extension = None
-    
-    # Supported formats
-    supported_formats = ['.csv', '.xlsx', '.xls', '.txt']
-    for ext in supported_formats:
-        if filename_lower.endswith(ext):
-            file_extension = ext
-            break
-    
-    if not file_extension:
-        raise HTTPException(
-            status_code=400, 
-            detail=f"Unsupported file format. Supported formats: {', '.join(supported_formats)}"
-        )
-    
-    print(f"[UPLOAD] Received file: {file.filename} (Type: {file_extension})")
-    
-    # Save file
-    file_path = f"uploads/{file.filename}"
-    with open(file_path, "wb") as buffer:
-        content = await file.read()
-        buffer.write(content)
-    
-    print(f"[UPLOAD] File saved to: {file_path}")
-    
-    # Generate table name (remove extension and clean up)
-    base_name = file.filename
-    for ext in supported_formats:
-        base_name = base_name.replace(ext, '').replace(ext.upper(), '')
-    
-    table_name = base_name.replace('-', '_').replace(' ', '_').replace('.', '_').lower()
-    
-    # Process file based on format
-    result = await processor.process_file(file_path, table_name, file_extension)
-    
-    # Add info field to match frontend expectations
-    result["info"] = {
-        "row_count": result["row_count"],
-        "columns": result["columns"]
-    }
-    
-    return result
+    try:
+        # Get file extension
+        filename_lower = file.filename.lower()
+        file_extension = None
+        
+        # Supported formats
+        supported_formats = ['.csv', '.xlsx', '.xls', '.txt']
+        for ext in supported_formats:
+            if filename_lower.endswith(ext):
+                file_extension = ext
+                break
+        
+        if not file_extension:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Unsupported file format. Supported formats: {', '.join(supported_formats)}"
+            )
+        
+        print(f"[UPLOAD] Received file: {file.filename} (Type: {file_extension})")
+        file_size_mb = file.size / (1024 * 1024) if file.size else 0
+        print(f"[UPLOAD] File size: {file_size_mb:.2f} MB")
+        
+        # Save file
+        file_path = f"uploads/{file.filename}"
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+        
+        print(f"[UPLOAD] File saved to: {file_path}")
+        
+        # Generate table name (remove extension and clean up)
+        base_name = file.filename
+        for ext in supported_formats:
+            base_name = base_name.replace(ext, '').replace(ext.upper(), '')
+        
+        table_name = base_name.replace('-', '_').replace(' ', '_').replace('.', '_').lower()
+        print(f"[UPLOAD] Processing as table: {table_name}")
+        
+        # Process file based on format
+        result = await processor.process_file(file_path, table_name, file_extension)
+        
+        # Add info field to match frontend expectations
+        result["info"] = {
+            "row_count": result["row_count"],
+            "columns": result["columns"]
+        }
+        
+        print(f"[UPLOAD] Success: {result['row_count']} rows processed")
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[UPLOAD ERROR] {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.get("/tables")
 def list_tables():
@@ -281,18 +344,24 @@ def list_tables():
 def get_table_data(
     table_name: str,
     offset: int = Query(0, ge=0),
-    limit: int = Query(1000, ge=1, le=10000),
+    limit: Optional[int] = Query(1000, ge=1),
     filters: Optional[str] = Query(None),
     sort_by: Optional[str] = Query(None),
-    sort_desc: bool = Query(False)
+    sort_desc: bool = Query(False),
+    all: bool = Query(False)
 ):
-    """Get paginated table data"""
+    """Get table data; pass all=true to return all rows in one response"""
     filter_dict = {}
     if filters:
         try:
             filter_dict = json.loads(filters)
         except:
             pass
+    
+    # If all is requested, ignore pagination
+    if all:
+        limit = None
+        offset = 0
     
     return processor.get_data_page(table_name, offset, limit, filter_dict, sort_by, sort_desc)
 
@@ -704,8 +773,9 @@ async def restore_from_backup(file: UploadFile = File(...)):
 def global_search(
     table_name: str,
     query: str = Query(..., min_length=1),
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0)
+    limit: Optional[int] = Query(100, ge=1),
+    offset: int = Query(0, ge=0),
+    all: bool = Query(False)
 ):
     """Search across all columns in a table for matching records"""
     try:
@@ -733,11 +803,17 @@ def global_search(
         where_clause = " OR ".join(search_conditions)
         
         # Build the full query
-        search_query = f"""
-            SELECT * FROM {table_name}
-            WHERE {where_clause}
-            LIMIT {limit} OFFSET {offset}
-        """
+        if all:
+            search_query = f"""
+                SELECT * FROM {table_name}
+                WHERE {where_clause}
+            """
+        else:
+            search_query = f"""
+                SELECT * FROM {table_name}
+                WHERE {where_clause}
+                LIMIT {limit} OFFSET {offset}
+            """
         
         # Execute search
         result = processor.conn.execute(search_query).fetchall()
@@ -772,8 +848,8 @@ def global_search(
             "columns": columns,
             "total_matches": total_matches,
             "returned_count": len(data),
-            "offset": offset,
-            "limit": limit
+            "offset": 0 if all else offset,
+            "limit": None if all else limit
         }
         
     except Exception as e:

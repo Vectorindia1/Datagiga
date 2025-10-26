@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DataGiga UI</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div class="app">
+    <header class="app-header">
+      <h1>DataGiga</h1>
+      <nav>
+        <a href="#upload">Upload</a>
+        <a href="#merge">Merge</a>
+        <a href="#browse">Browse</a>
+      </nav>
+    </header>
+
+    <main>
+      <section id="status" class="card">
+        <div class="row">
+          <div>
+            <h2>Backend</h2>
+            <div id="backend-status" class="pill pill-gray">Checking…</div>
+          </div>
+          <div>
+            <h2>Tables</h2>
+            <select id="table-select"></select>
+            <button id="refresh-tables" class="btn">Refresh</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="upload" class="card">
+        <h2>Upload File</h2>
+        <div class="row">
+          <input type="file" id="file-input" accept=".csv,.xlsx,.xls,.txt" />
+          <button id="upload-btn" class="btn">Upload</button>
+        </div>
+        <pre id="upload-log" class="log"></pre>
+      </section>
+
+      <section id="merge" class="card">
+        <h2>Merge All Data</h2>
+        <div class="row">
+          <button id="merge-all-btn" class="btn btn-accent">Merge All</button>
+          <span id="merge-hint" class="muted">Merges files from data/ and uploads/ plus existing tables</span>
+        </div>
+        <pre id="merge-log" class="log"></pre>
+      </section>
+
+      <section id="browse" class="card">
+        <h2>Browse & Search</h2>
+        <div class="row">
+          <input id="search-input" placeholder="Global search in selected table…" />
+          <button id="search-btn" class="btn">Search</button>
+          <button id="load-data-btn" class="btn">Load Data</button>
+          <label class="muted">Rows/page
+            <select id="page-size">
+              <option value="50">50</option>
+              <option value="100" selected>100</option>
+              <option value="200">200</option>
+              <option value="all">All</option>
+            </select>
+          </label>
+        </div>
+
+        <div id="result-meta" class="muted"></div>
+        <div id="grid" class="grid"></div>
+        <div class="pager">
+          <button id="prev-page" class="btn">Prev</button>
+          <span id="page-info" class="muted"></span>
+          <button id="next-page" class="btn">Next</button>
+        </div>
+      </section>
+    </main>
+
+    <footer class="app-footer">DataGiga • Minimal dark UI</footer>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
